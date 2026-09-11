@@ -1,0 +1,949 @@
+name: Build QuestMate Complete
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Create QuestMate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf app .quest-helper
+          mkdir -p app/src/main/java/com/questmate/complete
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/assets
+          mkdir -p tools
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "QuestMateComplete"
+          include(":app")
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.questmate.complete'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.questmate.complete'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 4
+                  versionName "4.0"
+              }
+
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+                  release {
+                      minifyEnabled false
+                      shrinkResources false
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <resources>
+              <color name="qm_bg">#101318</color>
+              <color name="qm_panel">#171B21</color>
+              <color name="qm_panel2">#20252D</color>
+              <color name="qm_text">#F3F5F7</color>
+              <color name="qm_muted">#AEB5BF</color>
+              <color name="qm_accent">#E4B34C</color>
+              <color name="qm_divider">#303640</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:statusBarColor">@color/qm_bg</item>
+                  <item name="android:navigationBarColor">@color/qm_bg</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="QuestMate Complete"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # =====================================================
+          # QUEST DATABASE GENERATOR
+          # Builds a self-contained quest database from the
+          # current RuneLite Quest Helper source.
+          # No Wiki URL is stored or displayed in the app.
+          # =====================================================
+
+          cat > tools/generate_quests.py <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[1]
+          SOURCE = ROOT / ".quest-helper"
+          OUTPUT = ROOT / "app" / "src" / "main" / "assets" / "quests.json"
+
+          if not SOURCE.exists():
+              subprocess.run(
+                  [
+                      "git", "clone", "--depth", "1",
+                      "https://github.com/Zoinkwiz/quest-helper.git",
+                      str(SOURCE)
+                  ],
+                  check=True
+              )
+
+          JAVA_ROOT = SOURCE / "src" / "main" / "java"
+          java_files = list(JAVA_ROOT.rglob("*.java"))
+
+          def clean(value):
+              value = value.replace("\\n", " ")
+              value = value.replace("\\t", " ")
+              value = value.replace('\\"', '"')
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+          def strings(text):
+              out = []
+              for m in re.finditer(r'"((?:\\.|[^"\\])*)"', text):
+                  v = clean(m.group(1))
+                  if v:
+                      out.append(v)
+              return out
+
+          # Quest enum/name lookup.
+          quest_names = {}
+          for f in java_files:
+              if f.name != "QuestHelperQuest.java":
+                  continue
+              text = f.read_text(encoding="utf-8", errors="ignore")
+              for m in re.finditer(
+                  r'^\s*([A-Z0-9_]+)\s*\(\s*"([^"]+)"',
+                  text,
+                  re.MULTILINE
+              ):
+                  quest_names[m.group(1).strip()] = m.group(2).strip()
+
+          quest_files = [
+              f for f in java_files
+              if "/helpers/quests/" in str(f).replace("\\", "/")
+          ]
+
+          locations = [
+              "Lumbridge","Lumbridge Castle","Varrock","Falador",
+              "Draynor Village","Al Kharid","Port Sarim","Edgeville",
+              "Barbarian Village","Taverley","Karamja","Ardougne",
+              "East Ardougne","West Ardougne","Yanille","Canifis",
+              "Mort'ton","Burthorpe","Rellekka","Seers' Village",
+              "Catherby","Camelot","Prifddinas","Tirannwn","Lletya",
+              "Tree Gnome Village","Gnome Stronghold","Grand Tree",
+              "Kourend","Great Kourend","Hosidius","Lovakengj","Shayzien",
+              "Arceuus","Piscarilius","Shilo Village","Nardah",
+              "Pollnivneach","Sophanem","Menaphos","Trollheim",
+              "Wilderness","Dwarven Mine","Fremennik Province","Lunar Isle",
+              "Mos Le'Harmless","Port Khazard","Port Phasmatys",
+              "Darkmeyer","Slepe","Ver Sinhaza","Draynor Manor",
+              "White Wolf Mountain","Death Plateau","Troll Stronghold",
+              "Underground Pass","Ape Atoll","Crash Island","Entrana",
+              "Jatizso","Neitiznot","Kharidian Desert","Ice Mountain",
+              "Crandor","Dragon Slayer Isle","Legends' Guild",
+              "Champions' Guild","Heroes' Guild","Warriors' Guild",
+              "Fishing Guild","Crafting Guild","Mining Guild",
+              "Cooking Guild","Wizard's Tower","Dark Wizards' Tower",
+              "Observatory","Digsite","Digsite Camp","Varrock Museum",
+              "Haunted Woods","Fossil Island","Lighthouse","Waterbirth Island",
+              "Tai Bwo Wannai","Brimhaven","Karamja Volcano","Zanaris",
+              "Fairy Ring","Cairn Isle","Piscatoris","Port Piscarilius",
+              "Varlamore","Cam Torum","Civitas illa Fortis"
+          ]
+
+          item_patterns = [
+              r'new\s+ItemRequirement\s*\(\s*"((?:\\.|[^"\\])*)',
+              r'ItemRequirement\s*\(\s*"((?:\\.|[^"\\])*)',
+              r'new\s+ItemRequirements?\s*\(\s*"((?:\\.|[^"\\])*)'
+          ]
+
+          def extract_items(text):
+              result = []
+              for pattern in item_patterns:
+                  for m in re.finditer(pattern, text, re.DOTALL):
+                      v = clean(m.group(1))
+                      if 2 <= len(v) <= 120 and v.lower() not in ("null","this"):
+                          if v not in result:
+                              result.append(v)
+              return result
+
+          def extract_skills(text):
+              result = []
+              skill_words = [
+                  "Attack","Strength","Defence","Ranged","Prayer","Magic",
+                  "Runecraft","Construction","Hitpoints","Agility",
+                  "Herblore","Thieving","Crafting","Fletching","Slayer",
+                  "Hunter","Mining","Smithing","Fishing","Cooking",
+                  "Firemaking","Woodcutting","Farming"
+              ]
+              for s in skill_words:
+                  if re.search(r"\b" + re.escape(s) + r"\b", text):
+                      if s not in result:
+                          result.append(s)
+              return result
+
+          def extract_npcs(text):
+              result = []
+              # Pull strings that look like NPC names from common NPC
+              # requirement/step constructors.
+              patterns = [
+                  r'NpcStep\s*\([^,]*,\s*"([^"]+)"',
+                  r'NpcStep\s*\(\s*"([^"]+)"',
+                  r'NpcRequirement\s*\(\s*"([^"]+)"',
+                  r'new\s+NpcStep\s*\([^,]*,\s*"([^"]+)"'
+              ]
+              for p in patterns:
+                  for m in re.finditer(p, text, re.DOTALL):
+                      v = clean(m.group(1))
+                      if 2 <= len(v) <= 100 and v not in result:
+                          result.append(v)
+              return result[:80]
+
+          def extract_steps(text):
+              steps = []
+              constructors = [
+                  "DetailedQuestStep","NpcStep","ObjectStep",
+                  "GroundItemStep","WidgetStep","TileObjectStep",
+                  "WorldPointStep","QuestStep"
+              ]
+
+              for constructor in constructors:
+                  for m in re.finditer(
+                      constructor + r"\s*\((.*?)\)",
+                      text,
+                      re.DOTALL
+                  ):
+                      vals = strings(m.group(1))
+                      for v in vals:
+                          v = clean(v)
+                          low = v.lower()
+                          if not 8 <= len(v) <= 500:
+                              continue
+                          if low in ("null","this"):
+                              continue
+                          if "questhelperquest" in low:
+                              continue
+                          if v not in steps:
+                              steps.append(v)
+
+              if not steps:
+                  candidates = strings(text)
+                  action_words = (
+                      "talk","speak","go ","travel","return","use ",
+                      "take ","bring","find","search","kill","pick",
+                      "enter","climb","open","give","mine","fish",
+                      "cook","bury","dig","wear","equip"
+                  )
+                  for v in candidates:
+                      low = v.lower()
+                      if 12 <= len(v) <= 400 and any(
+                          w in low for w in action_words
+                      ):
+                          if v not in steps:
+                              steps.append(v)
+
+              return steps[:180]
+
+          def quest_key(f):
+              return f.stem.upper().replace("-", "_")
+
+          quests = {}
+
+          for f in quest_files:
+              text = f.read_text(encoding="utf-8", errors="ignore")
+              key = quest_key(f)
+
+              name = quest_names.get(key)
+              if not name:
+                  readable = re.sub(r"(?<!^)(?=[A-Z])", " ", f.stem).strip()
+                  name = readable
+
+              if not name or name.lower() == "unknown quest":
+                  continue
+
+              steps = extract_steps(text)
+              if not steps:
+                  continue
+
+              items = extract_items(text)
+              skills = extract_skills(text)
+              npcs = extract_npcs(text)
+
+              combined = " ".join(steps)
+
+              places = []
+              for location in locations:
+                  if location.lower() in combined.lower():
+                      if location not in places:
+                          places.append(location)
+
+              # Keep the information self-contained. The app does not
+              # display or depend on an external Wiki link.
+              quests[name] = {
+                  "name": name,
+                  "items": items,
+                  "skills": skills,
+                  "npcs": npcs,
+                  "places": places,
+                  "start": steps[0],
+                  "steps": steps,
+                  "source": "RuneLite Quest Helper"
+              }
+
+          data = sorted(
+              quests.values(),
+              key=lambda q: q["name"].lower()
+          )
+
+          if len(data) < 100:
+              raise RuntimeError(
+                  f"Quest database generation failed: only {len(data)} quests found."
+              )
+
+          for q in data:
+              if not q["name"] or q["name"].lower() == "unknown quest":
+                  raise RuntimeError("Invalid quest name detected.")
+              if not q["steps"]:
+                  raise RuntimeError(f"No walkthrough for {q['name']}.")
+
+          OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+          OUTPUT.write_text(
+              json.dumps(data, ensure_ascii=False, indent=2),
+              encoding="utf-8"
+          )
+
+          print("======================================")
+          print(" QUESTMATE DATABASE GENERATED")
+          print("======================================")
+          print("Quests:", len(data))
+          print("Item lists:", sum(bool(q["items"]) for q in data))
+          print("Skill information:", sum(bool(q["skills"]) for q in data))
+          print("NPC information:", sum(bool(q["npcs"]) for q in data))
+          print("Locations:", sum(bool(q["places"]) for q in data))
+          print("Walkthroughs:", sum(bool(q["steps"]) for q in data))
+          print("======================================")
+          PY
+
+          # =====================================================
+          # ANDROID APP
+          # =====================================================
+
+          cat > app/src/main/java/com/questmate/complete/MainActivity.java <<'EOF'
+          package com.questmate.complete;
+
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity {
+
+              private static final int BG = Color.rgb(16, 19, 24);
+              private static final int TEXT = Color.rgb(243, 245, 247);
+              private static final int MUTED = Color.rgb(174, 181, 191);
+              private static final int ACCENT = Color.rgb(228, 179, 76);
+              private static final int DIVIDER = Color.rgb(48, 54, 64);
+
+              private final List<Quest> quests = new ArrayList<>();
+              private LinearLayout questList;
+              private EditText search;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  getWindow().setStatusBarColor(BG);
+                  getWindow().setNavigationBarColor(BG);
+
+                  loadQuests();
+                  showQuestList();
+              }
+
+              private int dp(float value) {
+                  return (int) (
+                      value * getResources().getDisplayMetrics().density + 0.5f
+                  );
+              }
+
+              private TextView text(String value, float size, int color) {
+                  TextView view = new TextView(this);
+                  view.setText(value);
+                  view.setTextSize(size);
+                  view.setTextColor(color);
+                  view.setPadding(dp(16), dp(10), dp(16), dp(10));
+                  return view;
+              }
+
+              private TextView heading(String value) {
+                  TextView view = text(value, 28, TEXT);
+                  view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  view.setPadding(dp(18), dp(12), dp(18), dp(4));
+                  return view;
+              }
+
+              private TextView section(String value) {
+                  TextView view = text(value, 20, ACCENT);
+                  view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+                  view.setPadding(dp(16), dp(20), dp(16), dp(8));
+                  return view;
+              }
+
+              private void base(LinearLayout root) {
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(BG);
+              }
+
+              private void showQuestList() {
+                  LinearLayout root = new LinearLayout(this);
+                  base(root);
+
+                  root.addView(heading("QuestMate Complete"));
+
+                  TextView count = text(
+                      quests.size() + " quests • Complete walkthroughs",
+                      16,
+                      MUTED
+                  );
+                  count.setPadding(dp(18), 0, dp(18), dp(12));
+                  root.addView(count);
+
+                  search = new EditText(this);
+                  search.setHint("Search quests...");
+                  search.setHintTextColor(MUTED);
+                  search.setTextColor(TEXT);
+                  search.setTextSize(18);
+                  search.setSingleLine(true);
+                  search.setPadding(dp(18), dp(8), dp(18), dp(8));
+
+                  root.addView(
+                      search,
+                      new LinearLayout.LayoutParams(-1, dp(58))
+                  );
+
+                  ScrollView scroll = new ScrollView(this);
+                  questList = new LinearLayout(this);
+                  questList.setOrientation(LinearLayout.VERTICAL);
+                  scroll.addView(questList);
+
+                  root.addView(
+                      scroll,
+                      new LinearLayout.LayoutParams(-1, 0, 1)
+                  );
+
+                  setContentView(root);
+                  renderQuestList("");
+
+                  search.addTextChangedListener(
+                      new android.text.TextWatcher() {
+                          @Override
+                          public void beforeTextChanged(
+                              CharSequence s, int start, int count, int after) {}
+
+                          @Override
+                          public void onTextChanged(
+                              CharSequence s, int start, int before, int count) {
+                              renderQuestList(s.toString());
+                          }
+
+                          @Override
+                          public void afterTextChanged(
+                              android.text.Editable s) {}
+                      }
+                  );
+              }
+
+              private void renderQuestList(String query) {
+                  questList.removeAllViews();
+
+                  String q = query.trim().toLowerCase(Locale.ROOT);
+                  int shown = 0;
+
+                  for (final Quest quest : quests) {
+                      if (!q.isEmpty() &&
+                          !quest.name.toLowerCase(Locale.ROOT).contains(q)) {
+                          continue;
+                      }
+
+                      TextView row = text(quest.name, 18, TEXT);
+                      row.setGravity(Gravity.CENTER_VERTICAL);
+                      row.setMinHeight(dp(64));
+                      row.setOnClickListener(v -> showQuest(quest));
+
+                      questList.addView(
+                          row,
+                          new LinearLayout.LayoutParams(-1, dp(64))
+                      );
+
+                      View divider = new View(this);
+                      divider.setBackgroundColor(DIVIDER);
+                      questList.addView(
+                          divider,
+                          new LinearLayout.LayoutParams(-1, dp(1))
+                      );
+
+                      shown++;
+                  }
+
+                  if (shown == 0) {
+                      questList.addView(
+                          text("No quests match your search.", 17, MUTED)
+                      );
+                  }
+              }
+
+              private void addBulletSection(
+                  LinearLayout body,
+                  String title,
+                  List<String> values,
+                  String emptyText) {
+
+                  body.addView(section(title));
+
+                  if (values.isEmpty()) {
+                      body.addView(text(emptyText, 15, MUTED));
+                      return;
+                  }
+
+                  for (String value : values) {
+                      body.addView(text("• " + value, 16, TEXT));
+                  }
+              }
+
+              private void showQuest(Quest quest) {
+                  LinearLayout root = new LinearLayout(this);
+                  base(root);
+
+                  LinearLayout top = new LinearLayout(this);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+
+                  TextView back = text("‹", 40, TEXT);
+                  back.setGravity(Gravity.CENTER);
+                  back.setPadding(0, 0, 0, 0);
+
+                  top.addView(
+                      back,
+                      new LinearLayout.LayoutParams(dp(58), dp(60))
+                  );
+
+                  TextView title = text(quest.name, 22, TEXT);
+                  title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+
+                  top.addView(
+                      title,
+                      new LinearLayout.LayoutParams(0, dp(60), 1)
+                  );
+
+                  root.addView(top);
+                  back.setOnClickListener(v -> showQuestList());
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout body = new LinearLayout(this);
+                  body.setOrientation(LinearLayout.VERTICAL);
+                  body.setPadding(0, 0, 0, dp(30));
+
+                  // -------------------------------------------------
+                  // EVERYTHING NEEDED BEFORE STARTING
+                  // -------------------------------------------------
+
+                  body.addView(section("Quest Information"));
+
+                  body.addView(
+                      text(
+                          "Quest: " + quest.name,
+                          17,
+                          TEXT
+                      )
+                  );
+
+                  body.addView(
+                      text(
+                          "Starting information: " +
+                          (quest.start.isEmpty()
+                              ? "See first walkthrough step."
+                              : quest.start),
+                          16,
+                          TEXT
+                      )
+                  );
+
+                  addBulletSection(
+                      body,
+                      "Items Required",
+                      quest.items,
+                      "No specific items were detected. Read the walkthrough before starting."
+                  );
+
+                  addBulletSection(
+                      body,
+                      "Skill Requirements",
+                      quest.skills,
+                      "No specific skill names were detected in the source data."
+                  );
+
+                  addBulletSection(
+                      body,
+                      "NPCs Referenced",
+                      quest.npcs,
+                      "NPC names will be shown within the relevant walkthrough steps."
+                  );
+
+                  addBulletSection(
+                      body,
+                      "Places Referenced",
+                      quest.places,
+                      "Locations are identified within the walkthrough."
+                  );
+
+                  // -------------------------------------------------
+                  // DETAILED WALKTHROUGH
+                  // The walkthrough is the complete self-contained
+                  // guide. No Wiki link is shown.
+                  // -------------------------------------------------
+
+                  body.addView(section("Step-by-Step Walkthrough"));
+
+                  int number = 1;
+
+                  for (String step : quest.steps) {
+                      TextView stepView = text(
+                          number + ". " + step,
+                          16,
+                          TEXT
+                      );
+
+                      stepView.setLineSpacing(0, 1.12f);
+                      stepView.setPadding(
+                          dp(16),
+                          dp(10),
+                          dp(16),
+                          dp(10)
+                      );
+
+                      body.addView(stepView);
+
+                      number++;
+                  }
+
+                  body.addView(section("Quest Complete"));
+
+                  body.addView(
+                      text(
+                          "Follow the numbered steps above from start to finish. " +
+                          "The item, NPC and location information is kept in this " +
+                          "same quest page so you do not need to leave the app.",
+                          16,
+                          MUTED
+                      )
+                  );
+
+                  scroll.addView(body);
+
+                  root.addView(
+                      scroll,
+                      new LinearLayout.LayoutParams(-1, 0, 1)
+                  );
+
+                  setContentView(root);
+              }
+
+              private void loadQuests() {
+                  try {
+                      InputStream input =
+                          getAssets().open("quests.json");
+
+                      BufferedReader reader =
+                          new BufferedReader(
+                              new InputStreamReader(input)
+                          );
+
+                      StringBuilder json = new StringBuilder();
+                      String line;
+
+                      while ((line = reader.readLine()) != null) {
+                          json.append(line);
+                      }
+
+                      reader.close();
+
+                      JSONArray array =
+                          new JSONArray(json.toString());
+
+                      for (int i = 0; i < array.length(); i++) {
+                          JSONObject object =
+                              array.getJSONObject(i);
+
+                          Quest quest = new Quest();
+
+                          quest.name =
+                              object.optString("name", "").trim();
+
+                          quest.start =
+                              object.optString("start", "").trim();
+
+                          readArray(
+                              object.optJSONArray("items"),
+                              quest.items
+                          );
+
+                          readArray(
+                              object.optJSONArray("skills"),
+                              quest.skills
+                          );
+
+                          readArray(
+                              object.optJSONArray("npcs"),
+                              quest.npcs
+                          );
+
+                          readArray(
+                              object.optJSONArray("places"),
+                              quest.places
+                          );
+
+                          readArray(
+                              object.optJSONArray("steps"),
+                              quest.steps
+                          );
+
+                          if (!quest.name.isEmpty() &&
+                              !quest.name.equalsIgnoreCase("Unknown Quest") &&
+                              !quest.steps.isEmpty()) {
+                              quests.add(quest);
+                          }
+                      }
+
+                      Collections.sort(
+                          quests,
+                          new Comparator<Quest>() {
+                              @Override
+                              public int compare(
+                                  Quest a,
+                                  Quest b) {
+                                  return a.name
+                                      .toLowerCase(Locale.ROOT)
+                                      .compareTo(
+                                          b.name.toLowerCase(Locale.ROOT)
+                                      );
+                              }
+                          }
+                      );
+
+                  } catch (Exception error) {
+                      Quest errorQuest = new Quest();
+                      errorQuest.name = "Quest database error";
+                      errorQuest.start = error.toString();
+                      errorQuest.steps.add(
+                          "The quest database could not be loaded. " +
+                          "Re-run the GitHub Actions build."
+                      );
+                      quests.add(errorQuest);
+                  }
+              }
+
+              private void readArray(
+                  JSONArray array,
+                  List<String> destination) {
+
+                  if (array == null) {
+                      return;
+                  }
+
+                  for (int i = 0; i < array.length(); i++) {
+                      String value = array.optString(i, "").trim();
+
+                      if (!value.isEmpty() &&
+                          !destination.contains(value)) {
+                          destination.add(value);
+                      }
+                  }
+              }
+
+              private static class Quest {
+                  String name = "";
+                  String start = "";
+
+                  List<String> items =
+                      new ArrayList<>();
+
+                  List<String> skills =
+                      new ArrayList<>();
+
+                  List<String> npcs =
+                      new ArrayList<>();
+
+                  List<String> places =
+                      new ArrayList<>();
+
+                  List<String> steps =
+                      new ArrayList<>();
+              }
+          }
+          EOF
+
+      - name: Generate complete quest database
+        run: |
+          python3 tools/generate_quests.py
+
+      - name: Validate quest database
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          path = "app/src/main/assets/quests.json"
+
+          with open(path, "r", encoding="utf-8") as f:
+              quests = json.load(f)
+
+          print("Quest records:", len(quests))
+
+          if len(quests) < 100:
+              print("ERROR: Too few quest records.")
+              sys.exit(1)
+
+          for quest in quests:
+              name = quest.get("name", "").strip()
+
+              if not name:
+                  print("ERROR: Empty quest name.")
+                  sys.exit(1)
+
+              if name.lower() == "unknown quest":
+                  print("ERROR: Unknown Quest found.")
+                  sys.exit(1)
+
+              if not quest.get("steps"):
+                  print("ERROR: No walkthrough:", name)
+                  sys.exit(1)
+
+          print("DATABASE VALIDATION PASSED")
+          PY
+
+      - name: Build QuestMate APK
+        run: |
+          gradle :app:assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK
+        run: |
+          if [ ! -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            echo "APK WAS NOT CREATED"
+            exit 1
+          fi
+
+          ls -lh app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload QuestMate APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuestMate-Complete-v4
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
